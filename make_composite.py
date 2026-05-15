@@ -1,55 +1,78 @@
-from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw, ImageOps, ImageChops
 import numpy as np
 
-def remove_white_bg(img, threshold=240):
+def remove_white_bg(img, threshold=238):
     img = img.convert("RGBA")
-    data = np.array(img)
-    r, g, b, a = data[:,:,0], data[:,:,1], data[:,:,2], data[:,:,3]
-    white_mask = (r > threshold) & (g > threshold) & (b > threshold)
-    data[:,:,3] = np.where(white_mask, 0, 255)
-    # Soften edges
-    result = Image.fromarray(data, 'RGBA')
-    return result
+    data = np.array(img, dtype=np.float32)
+    r, g, b = data[:,:,0], data[:,:,1], data[:,:,2]
+    # White mask - pixels close to white
+    whiteness = (r + g + b) / 3
+    is_white = (r > threshold) & (g > threshold) & (b > threshold)
+    # Also catch near-grey background
+    saturation = np.max(data[:,:,:3], axis=2) - np.min(data[:,:,:3], axis=2)
+    low_sat_bright = (whiteness > 225) & (saturation < 18)
+    mask = is_white | low_sat_bright
+    result = data.copy()
+    result[:,:,3] = np.where(mask, 0, 255)
+    # Feather edges
+    alpha_img = Image.fromarray(result[:,:,3].astype(np.uint8), 'L')
+    alpha_img = alpha_img.filter(ImageFilter.MaxFilter(3))
+    alpha_img = alpha_img.filter(ImageFilter.GaussianBlur(1.2))
+    result[:,:,3] = np.array(alpha_img)
+    return Image.fromarray(result.astype(np.uint8), 'RGBA')
 
-def add_drop_shadow(char, blur=12, offset=(10, 16), opacity=0.55):
-    shadow = Image.new("RGBA", (char.width + abs(offset[0])*3, char.height + abs(offset[1])*3), (0,0,0,0))
-    alpha = char.split()[3]
-    shadow_body = Image.new("RGBA", char.size, (0,0,0,0))
-    shadow_data = np.zeros((char.height, char.width, 4), dtype=np.uint8)
-    alpha_arr = np.array(alpha)
-    shadow_data[:,:,3] = (alpha_arr * opacity).astype(np.uint8)
-    shadow_body = Image.fromarray(shadow_data, 'RGBA')
-    shadow_body = shadow_body.filter(ImageFilter.GaussianBlur(blur))
-    result = Image.new("RGBA", shadow.size, (0,0,0,0))
-    result.paste(shadow_body, (abs(offset[0]) + offset[0], abs(offset[1]) + offset[1]), shadow_body)
-    result.paste(char, (abs(offset[0]), abs(offset[1])), char)
-    return result
+def make_ground_shadow(char, clinic_brightness=0.65, blur=18, squish=0.22):
+    """Realistic elliptical ground shadow."""
+    alpha = np.array(char.split()[3])
+    # Collapse to bottom strip to simulate ground contact
+    shadow_h = max(1, int(char.height * squish))
+    shadow_w = int(char.width * 1.1)
+    # Project alpha to bottom
+    col_alpha = alpha.max(axis=0)
+    col_alpha = np.clip(col_alpha.astype(float) * 0.7, 0, 200)
+    # Build shadow strip
+    shadow = np.zeros((shadow_h, shadow_w, 4), dtype=np.uint8)
+    for y in range(shadow_h):
+        fade = 1.0 - y / shadow_h
+        row_alpha = (col_alpha * fade).astype(np.uint8)
+        x_offset = (shadow_w - len(row_alpha)) // 2
+        end = min(x_offset + len(row_alpha), shadow_w)
+        actual_len = end - x_offset
+        shadow[y, x_offset:end, 3] = row_alpha[:actual_len]
+    shadow_img = Image.fromarray(shadow, 'RGBA')
+    shadow_img = shadow_img.filter(ImageFilter.GaussianBlur(blur))
+    return shadow_img
 
-# Load images
+def color_grade(char, warmth=0.06, brightness=0.97):
+    """Tint character to match warm clinic lighting."""
+    arr = np.array(char.convert("RGBA"), dtype=np.float32)
+    arr[:,:,0] = np.clip(arr[:,:,0] * (1 + warmth), 0, 255)   # warm R
+    arr[:,:,1] = np.clip(arr[:,:,1] * (1 + warmth * 0.4), 0, 255)
+    arr[:,:,:3] = np.clip(arr[:,:,:3] * brightness, 0, 255)
+    return Image.fromarray(arr.astype(np.uint8), 'RGBA')
+
+# ── Load images ──────────────────────────────────────────────────────────────
 clinic = Image.open("dental_clinic.png").convert("RGBA")
 labubu_grid = Image.open("labubu.jpg").convert("RGBA")
 
 cw, ch = clinic.size
 lw, lh = labubu_grid.size
 
-# Upscale clinic for better quality output
-scale = 2
-clinic = clinic.resize((cw * scale, ch * scale), Image.LANCZOS)
+# Upscale clinic 2× for crisp output
+clinic = clinic.resize((cw * 2, ch * 2), Image.LANCZOS)
 cw, ch = clinic.size
 
-# Crop Labubu characters from the 3x3 grid
-# Grid: 3 cols x 3 rows
+# ── Crop characters from 3×3 grid ────────────────────────────────────────────
 cell_w = lw // 3
 cell_h = lh // 3
 
-# Pick 5 characters: row0col0 (pink), row0col1 (green), row1col0 (blue),
-# row1col2 (cream), row0col2 (brown)
+# Picks: (row, col) → colors
 picks = [
-    (0, 0),  # pink - most front
+    (0, 2),  # brown   — furthest back (closest to door)
+    (1, 2),  # cream
     (0, 1),  # green
     (1, 0),  # blue/grey
-    (1, 2),  # cream
-    (0, 2),  # brown - furthest back
+    (0, 0),  # pink    — front of queue (furthest from door)
 ]
 
 chars = []
@@ -57,62 +80,53 @@ for row, col in picks:
     x1 = col * cell_w
     y1 = row * cell_h
     crop = labubu_grid.crop((x1, y1, x1 + cell_w, y1 + cell_h))
-    # Remove white background
-    crop = remove_white_bg(crop, threshold=235)
+    crop = remove_white_bg(crop)
+    # ── FLIP to face RIGHT (toward entrance) ──────────────────────────────
+    crop = ImageOps.mirror(crop)
+    crop = color_grade(crop)
     chars.append(crop)
 
-# Place characters in a queue in front of the clinic
-# Sidewalk starts around 78% down the clinic height
-sidewalk_baseline = int(ch * 0.82)
+# ── Layout: linear queue along sidewalk, right = closer to door ─────────────
+# Sidewalk baseline (bottom of feet)
+baseline_y = int(ch * 0.845)
 
-# Characters heights relative to clinic (with scale)
-base_char_h = int(ch * 0.24)
+# Each successive character in queue is slightly further back = smaller + higher
+base_h = int(ch * 0.26)      # front character height
+depth_step = 0.06            # each character is 6% smaller as they go back
 
-# Queue positions: spread along the lower portion, slight arc to simulate depth
-# Characters in the middle are slightly in front
-num = len(chars)
-# x positions: spread across 20% to 80% of clinic width
-xs = [int(cw * (0.20 + i * 0.145)) for i in range(num)]
-# Depth effect: middle chars slightly lower and larger
-depths = [0.82, 0.88, 1.0, 0.90, 0.84]
+# X positions: queue stretches left from the door (right side ~75%) toward left
+door_x = int(cw * 0.70)
+char_spacing = int(cw * 0.13)
 
 result = clinic.copy()
 
-# Draw in reverse order (back to front)
-for i in reversed(range(num)):
+# Render front-to-back so back chars go UNDER front chars
+for i in range(len(chars)):
     char = chars[i]
-    depth = depths[i]
-    h = int(base_char_h * depth)
-    ratio = h / char.height
-    w = int(char.width * ratio)
+    depth = 1.0 - i * depth_step   # front=1.0, back gets smaller
+
+    h = int(base_h * depth)
+    w = int(char.width * (h / char.height))
     char_scaled = char.resize((w, h), Image.LANCZOS)
 
-    # Add shadow
-    char_with_shadow = add_drop_shadow(char_scaled, blur=int(8 * depth), offset=(int(6*depth), int(10*depth)))
+    # Ground shadow
+    shadow = make_ground_shadow(char_scaled, blur=int(14 * depth))
+    sx = door_x - i * char_spacing - shadow.width // 2 + int(w * 0.05)
+    sy = baseline_y - int(shadow.height * 0.15)
+    if sx >= 0 and sy >= 0 and sx + shadow.width <= cw and sy + shadow.height <= ch:
+        result.alpha_composite(shadow, dest=(sx, sy))
 
-    # Bottom of character on sidewalk baseline
-    shadow_offset_y = int(8 * depth)
-    shadow_offset_x = int(6 * depth)
-    x = xs[i] - char_with_shadow.width // 2 + shadow_offset_x
-    y = sidewalk_baseline - char_with_shadow.height + shadow_offset_y + int((1-depth) * 30)
+    # Character — feet sit on baseline
+    x = door_x - i * char_spacing - w // 2
+    y = baseline_y - h
+    if x >= 0 and x + w <= cw:
+        result.alpha_composite(char_scaled, dest=(x, y))
 
-    result.alpha_composite(char_with_shadow, dest=(max(0, x), max(0, y)))
-
-# Add slight vignette
-vignette = Image.new("RGBA", result.size, (0,0,0,0))
-draw = ImageDraw.Draw(vignette)
-for r in range(80, 0, -1):
-    alpha = int((80 - r) * 1.2)
-    draw.ellipse([
-        -cw//4 + r*cw//160, -ch//4 + r*ch//160,
-        cw + cw//4 - r*cw//160, ch + ch//4 - r*ch//160
-    ], outline=(0,0,0,0))
-
-# Final enhancement
+# ── Final color grade ─────────────────────────────────────────────────────────
 final = result.convert("RGB")
-final = ImageEnhance.Color(final).enhance(1.08)
-final = ImageEnhance.Contrast(final).enhance(1.05)
-final = ImageEnhance.Sharpness(final).enhance(1.15)
+final = ImageEnhance.Color(final).enhance(1.06)
+final = ImageEnhance.Contrast(final).enhance(1.04)
+final = ImageEnhance.Sharpness(final).enhance(1.2)
 
-final.save("dental_labubu_queue.png", "PNG", optimize=False)
-print(f"Done! dental_labubu_queue.png — {final.size[0]}x{final.size[1]}px")
+final.save("dental_labubu_queue.png", "PNG")
+print(f"Done! {final.size[0]}x{final.size[1]}px")
